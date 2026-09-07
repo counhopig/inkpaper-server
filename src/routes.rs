@@ -21,6 +21,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use subtle::ConstantTimeEq;
+use inkwash_logic::sync_validate::{validate_date, validate_repeat};
 
 use crate::db::{self, Db};
 use crate::models::{
@@ -295,28 +296,51 @@ async fn change_password(
 fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, message.into()).into_response()
 }
-
-fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), &'static str> {
+/// Validates an alarm against the same rules the firmware enforces in
+/// `sync_validate.rs` — hour/minute range, Repeat validity, and for
+/// `Once` alarms the exact date range the PCF8563 + firmware recurrence
+/// math supports (2000–2099, with a real calendar day for that month/year).
+/// Mirrors `inkwash-firmware/logic/src/sync_validate.rs:validate_repeat` +
+/// `validate_date` so server-authored alarms can never produce a sync
+/// response the device will reject wholesale.
+fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), String> {
     if req.hour > 23 || req.minute > 59 {
-        return Err("hour must be 0..23 and minute must be 0..59");
+        return Err(format!(
+            "alarm time {:02}:{:02} is out of range (hour 0..23, minute 0..59)",
+            req.hour, req.minute
+        ));
     }
     if req.label.chars().count() > 40 {
-        return Err("alarm label must be at most 40 characters");
+        return Err("alarm label must be at most 40 characters".to_string());
     }
-    if let crate::models::Repeat::Once { year, month, day } = req.repeat {
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
-            return Err("invalid once-alarm date");
-        }
-    }
-    Ok(())
+    validate_repeat(&req.repeat)
+        .map_err(|err| format!("invalid repeat rule: {err}"))
 }
 
-fn validate_todo(req: &UpsertTodoRequest) -> Result<(), &'static str> {
+/// Validates a todo against the firmware's date/repeat rules
+/// (same crate as [`validate_alarm`]). `Once` is rejected because the
+/// device calendar/reminder logic only supports Daily/Weekly/Monthly for
+/// recurring todos — one-off due dates belong in `due_date`, not `repeat`.
+fn validate_todo(req: &UpsertTodoRequest) -> Result<(), String> {
+    let text_len = req.text.chars().count();
     if req.text.trim().is_empty() {
-        return Err("todo text must not be empty");
+        return Err("todo text must not be empty".to_string());
     }
-    if req.text.chars().count() > 120 {
-        return Err("todo text must be at most 120 characters");
+    if text_len > 120 {
+        return Err(format!(
+            "todo text must be at most 120 characters (got {text_len})"
+        ));
+    }
+    if let Some(due) = req.due_date {
+        validate_date(due.year, due.month, due.day)
+            .map_err(|err| format!("invalid due date: {err}"))?;
+    }
+    if let Some(repeat) = &req.repeat {
+        if matches!(repeat, crate::models::Repeat::Once { .. }) {
+            return Err("todo repeat Once is not supported; use due_date for a single due date".to_string());
+        }
+        validate_repeat(repeat)
+            .map_err(|err| format!("invalid repeat rule: {err}"))?;
     }
     Ok(())
 }
@@ -1256,5 +1280,114 @@ mod tests {
                 .0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// Server-side validation must reject the same malformed dates and repeat
+    /// rules the firmware rejects in `sync_validate.rs`, so alarms/todos that
+    /// pass the server can never cause a device sync failure.
+    #[test]
+    fn validate_alarm_rejects_firmware_invalid_inputs() {
+        // Weekly days must be in 0..=6 — day 7 is the firmware's boundary test.
+        let bad_weekly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Weekly { days: vec![0, 7] },
+            enabled: true,
+            label: "Bad weekly".into(),
+        };
+        assert!(validate_alarm(&bad_weekly).is_err());
+
+        // Empty Weekly days list.
+        let empty_weekly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Weekly { days: vec![] },
+            enabled: true,
+            label: "Empty weekly".into(),
+        };
+        assert!(validate_alarm(&empty_weekly).is_err());
+
+        // Monthly days must be 1..=31 — day 0 and 32 are out of range.
+        let bad_monthly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Monthly { days: vec![0] },
+            enabled: true,
+            label: "Bad monthly".into(),
+        };
+        assert!(validate_alarm(&bad_monthly).is_err());
+
+        // Once with an invalid calendar date (Feb 31).
+        let bad_once = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Once { year: 2026, month: 2, day: 31 },
+            enabled: true,
+            label: "Bad once".into(),
+        };
+        assert!(validate_alarm(&bad_once).is_err());
+
+        // Once year outside the firmware's 2000..=2099 window.
+        let bad_year = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Once { year: 1999, month: 12, day: 25 },
+            enabled: true,
+            label: "Bad year".into(),
+        };
+        assert!(validate_alarm(&bad_year).is_err());
+
+        // A valid alarm still passes.
+        let good = UpsertAlarmRequest {
+            hour: 7,
+            minute: 30,
+            repeat: crate::models::Repeat::Once { year: 2026, month: 12, day: 25 },
+            enabled: true,
+            label: "Christmas".into(),
+        };
+        assert!(validate_alarm(&good).is_ok());
+    }
+
+    #[test]
+    fn validate_todo_rejects_firmware_invalid_inputs() {
+        // Todo with Once repeat is rejected — use due_date instead.
+        let once_repeat = UpsertTodoRequest {
+            text: "One-off todo".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: None,
+            repeat: Some(crate::models::Repeat::Once { year: 2026, month: 6, day: 1 }),
+        };
+        assert!(validate_todo(&once_repeat).is_err());
+
+        // Todo with invalid due_date (April 31).
+        let bad_due = UpsertTodoRequest {
+            text: "Bad due".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: Some(crate::models::TodoDue { year: 2026, month: 4, day: 31 }),
+            repeat: None,
+        };
+        assert!(validate_todo(&bad_due).is_err());
+
+        // Empty text still rejected.
+        let empty_text = UpsertTodoRequest {
+            text: "  ".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: None,
+            repeat: None,
+        };
+        assert!(validate_todo(&empty_text).is_err());
+
+        // Valid todo with Weekly repeat and valid due_date passes.
+        let good = UpsertTodoRequest {
+            text: "Weekly review".into(),
+            done: false,
+            importance: crate::models::Importance::High,
+            due_date: Some(crate::models::TodoDue { year: 2026, month: 8, day: 19 }),
+            repeat: Some(crate::models::Repeat::Weekly { days: vec![1, 3, 5] }),
+        };
+        assert!(validate_todo(&good).is_ok());
     }
 }
