@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use super::queries::bump_version;
+use super::queries::{bump_version, lock_device_for_write, release_confirmed_local_ids};
 use super::Db;
 use crate::models::DeviceSyncRequest;
 
@@ -17,6 +17,7 @@ pub async fn merge_device_state(
     state: &DeviceSyncRequest,
 ) -> Result<i64> {
     let mut tx = db.pool.begin().await?;
+    lock_device_for_write(db, &mut *tx, device_id).await?;
     let mut changed = false;
     for alarm in &state.alarms {
         let res = sqlx::query(db.sql(
@@ -57,6 +58,10 @@ pub async fn merge_device_state(
             changed |= res.rows_affected() > 0;
         }
     }
+    let alarm_ids: Vec<u8> = state.alarms.iter().map(|alarm| alarm.id).collect();
+    let todo_ids: Vec<u8> = state.todos.iter().map(|todo| todo.id).collect();
+    release_confirmed_local_ids(db, &mut tx, device_id, "alarm", &alarm_ids).await?;
+    release_confirmed_local_ids(db, &mut tx, device_id, "todo", &todo_ids).await?;
     if changed {
         bump_version(db, &mut *tx, device_id).await?;
     }

@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use sqlx::{Any, Executor, Row};
+use sqlx::{Any, Executor, Row, Transaction};
 use uuid::Uuid;
 
 use super::Db;
@@ -273,28 +273,111 @@ pub async fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
         .collect()
 }
 
-async fn next_local_id<'e, E>(db: &Db, executor: E, table: &str, device_id: &str) -> Result<u8>
+/// Allocates the first wire-compatible id that has never been assigned to
+/// this device/list. Deleted ids stay in `device_local_ids`: the device may
+/// still have a dirty copy of one while it is waiting to receive the next
+/// authoritative sync response, so reusing it could apply stale state to a
+/// different record.
+async fn next_local_id<'e, E>(db: &Db, executor: E, kind: &str, device_id: &str) -> Result<u8>
 where
     E: Executor<'e, Database = Any>,
 {
-    let sql = if db.postgres {
-        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = $1")
-    } else {
-        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = ?")
-    };
-    let max: Option<i64> = sqlx::query_scalar(&sql)
-        .bind(device_id)
-        .fetch_one(executor)
-        .await?;
-    let next = max.map(|m| m + 1).unwrap_or(0);
-    u8::try_from(next).map_err(|_| anyhow!("device has reached the 256-alarm/todo id limit"))
+    let rows = sqlx::query(db.sql(
+        "SELECT local_id FROM device_local_ids WHERE device_id = ? AND kind = ?",
+        "SELECT local_id FROM device_local_ids WHERE device_id = $1 AND kind = $2",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .fetch_all(executor)
+    .await?;
+    let mut used = [false; 256];
+    for row in rows {
+        if let Ok(id) = usize::try_from(row.try_get::<i64, _>(0)?) {
+            if id < used.len() {
+                used[id] = true;
+            }
+        }
+    }
+    used.iter()
+        .position(|assigned| !assigned)
+        .and_then(|id| u8::try_from(id).ok())
+        .ok_or_else(|| anyhow!("device has reached the 256-alarm/todo id limit"))
 }
 
-/// Takes the SQLite writer lock before reading MAX(local_id). A deferred
-/// transaction would let concurrent upserts observe the same MAX and then
-/// race while upgrading to a writer; serializing on the device row keeps the
-/// allocation and insert in one lock-protected transaction.
-async fn lock_device_for_write<'e, E>(db: &Db, executor: E, device_id: &str) -> Result<()>
+async fn reserve_local_id(
+    db: &Db,
+    tx: &mut Transaction<'_, Any>,
+    device_id: &str,
+    kind: &str,
+    id: u8,
+) -> Result<()> {
+    let released: Option<i64> = sqlx::query_scalar(db.sql(
+        "SELECT released FROM device_local_ids WHERE device_id = ? AND kind = ? AND local_id = ?",
+        "SELECT released FROM device_local_ids WHERE device_id = $1 AND kind = $2 AND local_id = $3",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if released == Some(1) {
+        return Err(anyhow!("local id is awaiting device sync confirmation"));
+    }
+    sqlx::query(db.sql(
+        "INSERT INTO device_local_ids (device_id, kind, local_id, released) VALUES (?, ?, ?, 0) ON CONFLICT(device_id, kind, local_id) DO NOTHING",
+        "INSERT INTO device_local_ids (device_id, kind, local_id, released) VALUES ($1, $2, $3, 0) ON CONFLICT(device_id, kind, local_id) DO NOTHING",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn release_confirmed_local_ids(
+    db: &Db,
+    tx: &mut Transaction<'_, Any>,
+    device_id: &str,
+    kind: &str,
+    uploaded_ids: &[u8],
+) -> Result<()> {
+    let mut sql = format!(
+        "DELETE FROM device_local_ids WHERE device_id = {} AND kind = {} AND released = {}",
+        if db.postgres { "$1" } else { "?" },
+        if db.postgres { "$2" } else { "?" },
+        if db.postgres { "$3" } else { "?" },
+    );
+    if !uploaded_ids.is_empty() {
+        let placeholders = (0..uploaded_ids.len())
+            .map(|index| {
+                if db.postgres {
+                    format!("${}", index + 4)
+                } else {
+                    "?".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND local_id NOT IN ({placeholders})"));
+    }
+    let mut query = sqlx::query(&sql).bind(device_id).bind(kind).bind(1_i64);
+    for id in uploaded_ids {
+        query = query.bind(*id as i64);
+    }
+    query.execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Takes the SQLite writer lock before reading the allocation history. A
+/// deferred transaction would let concurrent upserts observe the same free
+/// slot and then race while upgrading to a writer; serializing on the device
+/// row keeps the allocation and insert in one lock-protected transaction.
+pub(crate) async fn lock_device_for_write<'e, E>(
+    db: &Db,
+    executor: E,
+    device_id: &str,
+) -> Result<()>
 where
     E: Executor<'e, Database = Any>,
 {
@@ -325,8 +408,9 @@ pub async fn upsert_alarm(
     lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
-        None => next_local_id(db, &mut *tx, "alarms", device_id).await?,
+        None => next_local_id(db, &mut *tx, "alarm", device_id).await?,
     };
+    reserve_local_id(db, &mut tx, device_id, "alarm", id).await?;
     let (repeat_kind, once_year, once_month, once_day, repeat_days) =
         repeat_to_columns(&req.repeat);
     sqlx::query(db.sql(
@@ -381,8 +465,9 @@ pub async fn upsert_todo(
     lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
-        None => next_local_id(db, &mut *tx, "todos", device_id).await?,
+        None => next_local_id(db, &mut *tx, "todo", device_id).await?,
     };
+    reserve_local_id(db, &mut tx, device_id, "todo", id).await?;
     let (due_year, due_month, due_day) = match req.due_date {
         Some(due) => (
             Some(due.year as i64),
@@ -446,6 +531,11 @@ pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
 /// `format!` here is safe (same pattern already used by `next_local_id`).
 async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Result<()> {
     let mut tx = db.pool.begin().await?;
+    let kind = match table {
+        "alarms" => "alarm",
+        "todos" => "todo",
+        _ => unreachable!("delete_local_id only accepts alarm/todo tables"),
+    };
     let sql = if db.postgres {
         format!("DELETE FROM {table} WHERE device_id = $1 AND local_id = $2")
     } else {
@@ -456,6 +546,15 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
         .bind(id as i64)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(db.sql(
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = ? AND kind = ? AND local_id = ?",
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = $1 AND kind = $2 AND local_id = $3",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .execute(&mut *tx)
+    .await?;
     bump_version(db, &mut *tx, device_id).await?;
     tx.commit().await?;
     Ok(())
@@ -466,12 +565,25 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
 /// `clear_todos` - see `delete_local_id` for why the `format!` here is safe.
 async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
     let mut tx = db.pool.begin().await?;
+    let kind = match table {
+        "alarms" => "alarm",
+        "todos" => "todo",
+        _ => unreachable!("clear_table only accepts alarm/todo tables"),
+    };
     let sql = if db.postgres {
         format!("DELETE FROM {table} WHERE device_id = $1")
     } else {
         format!("DELETE FROM {table} WHERE device_id = ?")
     };
     sqlx::query(&sql).bind(device_id).execute(&mut *tx).await?;
+    sqlx::query(db.sql(
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = ? AND kind = ?",
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = $1 AND kind = $2",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .execute(&mut *tx)
+    .await?;
     bump_version(db, &mut *tx, device_id).await?;
     tx.commit().await?;
     Ok(())

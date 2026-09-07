@@ -493,6 +493,91 @@ mod tests {
             .1;
         assert_eq!(after, before, "version must not advance on a failed write");
     }
+
+    #[tokio::test]
+    async fn local_ids_are_not_reused_after_delete_or_clear() {
+        let db = test_db().await;
+        let device = register_device(&db, "id-history", None).await.unwrap();
+        let request = |label: &str| UpsertAlarmRequest {
+            hour: 7,
+            minute: 0,
+            repeat: Repeat::Daily,
+            enabled: true,
+            label: label.to_string(),
+        };
+
+        // A high explicit id must not make the allocator report capacity
+        // exhausted while lower slots are still available.
+        let high = upsert_alarm(&db, &device.id, Some(255), &request("high"))
+            .await
+            .unwrap();
+        assert_eq!(high, 255);
+        let first = upsert_alarm(&db, &device.id, None, &request("first"))
+            .await
+            .unwrap();
+        assert_eq!(first, 0);
+
+        // The deleted high id remains reserved, so it cannot receive a
+        // stale enabled flag from the device while a replacement is absent.
+        delete_alarm(&db, &device.id, high).await.unwrap();
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![crate::models::DeviceAlarmState {
+                    id: high,
+                    enabled: false,
+                }],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let second = upsert_alarm(&db, &device.id, None, &request("second"))
+            .await
+            .unwrap();
+        assert_eq!(second, 1);
+
+        // Clearing the visible list also keeps its ids reserved. The next
+        // allocation advances to a never-used slot instead of reusing 0.
+        clear_alarms(&db, &device.id).await.unwrap();
+        let third = upsert_alarm(&db, &device.id, None, &request("third"))
+            .await
+            .unwrap();
+        assert_eq!(third, 2);
+
+        // Once a sync arrives without the deleted ids, the device has
+        // observed the authoritative list and those slots can be reclaimed.
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        clear_alarms(&db, &device.id).await.unwrap();
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let reclaimed = upsert_alarm(&db, &device.id, None, &request("reclaimed"))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 0);
+    }
+
     #[tokio::test]
     async fn alarm_todo_delete_and_account_updates() {
         let db = test_db().await;
