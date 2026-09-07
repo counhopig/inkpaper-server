@@ -52,6 +52,11 @@ pub async fn open(url: &str, max_connections: u32) -> Result<Db> {
                 sqlx::query("PRAGMA foreign_keys = ON")
                     .execute(&mut *conn)
                     .await?;
+                // Wait briefly for another writer instead of surfacing an
+                // avoidable SQLITE_BUSY error to the HTTP layer.
+                sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *conn)
+                    .await?;
                 Ok(())
             })
         });

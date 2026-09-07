@@ -156,6 +156,9 @@ async fn register_account(State(state): State<AppState>, Json(req): Json<AuthReq
     };
     let account = match db::register_account(&state.db, username, &hash).await {
         Ok(a) => a,
+        Err(err) if db::is_unique_violation(&err) => {
+            return (StatusCode::CONFLICT, "username already taken").into_response()
+        }
         Err(err) => return internal_error(err),
     };
     issue_session(&state, account).await

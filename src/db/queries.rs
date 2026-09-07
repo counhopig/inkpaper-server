@@ -274,6 +274,27 @@ where
     u8::try_from(next).map_err(|_| anyhow!("device has reached the 256-alarm/todo id limit"))
 }
 
+/// Takes the SQLite writer lock before reading MAX(local_id). A deferred
+/// transaction would let concurrent upserts observe the same MAX and then
+/// race while upgrading to a writer; serializing on the device row keeps the
+/// allocation and insert in one lock-protected transaction.
+async fn lock_device_for_write<'e, E>(db: &Db, executor: E, device_id: &str) -> Result<()>
+where
+    E: Executor<'e, Database = Any>,
+{
+    let result = sqlx::query(db.sql(
+        "UPDATE devices SET version = version WHERE id = ?",
+        "UPDATE devices SET version = version WHERE id = $1",
+    ))
+    .bind(device_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(anyhow!("device not found"));
+    }
+    Ok(())
+}
+
 /// Creates a new alarm (`id: None`) or replaces an existing one (`id:
 /// Some`) for `device_id`, and returns the alarm's id. Bumps the device's
 /// sync version in the same transaction so a failed write can't leave a
@@ -285,6 +306,7 @@ pub async fn upsert_alarm(
     req: &UpsertAlarmRequest,
 ) -> Result<u8> {
     let mut tx = db.pool.begin().await?;
+    lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
         None => next_local_id(db, &mut *tx, "alarms", device_id).await?,
@@ -340,6 +362,7 @@ pub async fn upsert_todo(
     req: &UpsertTodoRequest,
 ) -> Result<u8> {
     let mut tx = db.pool.begin().await?;
+    lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
         None => next_local_id(db, &mut *tx, "todos", device_id).await?,
@@ -455,6 +478,15 @@ pub async fn register_account(db: &Db, username: &str, password_hash: &str) -> R
         username: username.to_string(),
         created_at: now_unix(),
     })
+}
+
+/// Returns whether an anyhow-wrapped SQLx error is a backend unique-key
+/// violation. Routes use this to turn concurrent registration conflicts into
+/// the documented 409 response instead of a generic 500.
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(|db_err| db_err.is_unique_violation())
 }
 
 /// Returns `(account_id, password_hash)` for a username, if it exists.
@@ -913,6 +945,17 @@ pub async fn deliver_inbox(
     source_ref: Option<&str>,
 ) -> Result<(u64, bool)> {
     let mut tx = db.pool.begin().await?;
+    let channel_lock = sqlx::query(db.sql(
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ?",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    if channel_lock.rows_affected() == 0 {
+        return Err(anyhow!("channel not found"));
+    }
     if let Some(ref_ref) = source_ref {
         let existing: Option<i64> = sqlx::query_scalar(db.sql(
             "SELECT seq FROM inbox WHERE channel_id = ? AND source_ref = ?",
