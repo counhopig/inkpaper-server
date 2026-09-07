@@ -6,6 +6,7 @@ mod routes;
 use std::net::SocketAddr;
 
 use anyhow::Context;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 #[tokio::main]
@@ -42,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
         .context("BIND_ADDR must be a valid host:port")?;
 
     let db = db::open(&db_url, 2).await?;
-    let state = routes::AppState { db, admin_token };
+    let state = routes::AppState::new(db, admin_token);
 
     // Deliberately no CORS layer. Every legitimate client is either
     // same-origin (the embedded admin console, including its Vite dev
@@ -51,10 +52,16 @@ async fn main() -> anyhow::Result<()> {
     // kind is affected by CORS. The old blanket `CorsLayer::permissive()`
     // only widened browser attack surface for no working cross-origin
     // client, so it was removed rather than narrowed.
-    let app = routes::router(state).layer(TraceLayer::new_for_http());
+    let app = routes::router(state)
+        .layer(ConcurrencyLimitLayer::new(64))
+        .layer(TraceLayer::new_for_http());
 
     tracing::info!("inkwash-server listening on {bind_addr}, db={db_kind}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

@@ -14,8 +14,16 @@
 //! everything, including unowned devices (the ones the desktop tool
 //! registers), so existing desktop workflows keep working unchanged.
 
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -44,9 +52,97 @@ struct AdminAssets;
 pub struct AppState {
     pub db: Db,
     pub admin_token: String,
+    rate_limiter: Arc<RateLimiter>,
+}
+
+impl AppState {
+    pub fn new(db: Db, admin_token: String) -> Self {
+        Self {
+            db,
+            admin_token,
+            rate_limiter: Arc::new(RateLimiter::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RateLimiter {
+    buckets: Mutex<HashMap<String, RateBucket>>,
+}
+
+struct RateBucket {
+    started: Instant,
+    count: u32,
+}
+
+impl RateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const PER_IP_LIMIT: u32 = 120;
+    const PER_TOKEN_LIMIT: u32 = 240;
+
+    fn allow(&self, keys: &[(String, u32)]) -> bool {
+        let now = Instant::now();
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return false;
+        };
+        buckets.retain(|_, bucket| now.duration_since(bucket.started) < Self::WINDOW);
+        if keys.iter().any(|(key, limit)| {
+            buckets
+                .get(key)
+                .is_some_and(|bucket| bucket.count >= *limit)
+        }) {
+            return false;
+        }
+        for (key, _) in keys {
+            let bucket = buckets.entry(key.clone()).or_insert(RateBucket {
+                started: now,
+                count: 0,
+            });
+            bucket.count += 1;
+        }
+        true
+    }
+}
+
+async fn enforce_rate_limit(
+    State(limiter): State<Arc<RateLimiter>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut keys = vec![(format!("ip:{ip}"), RateLimiter::PER_IP_LIMIT)];
+    if let Some(token) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        let mut hasher = DefaultHasher::new();
+        token.hash(&mut hasher);
+        keys.push((
+            format!("token:{:016x}", hasher.finish()),
+            RateLimiter::PER_TOKEN_LIMIT,
+        ));
+    }
+    if !limiter.allow(&keys) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(request).await
 }
 
 pub fn router(state: AppState) -> Router {
+    let rate_limiter = state.rate_limiter.clone();
     Router::new()
         .route("/", get(admin_index))
         .route("/assets/*path", get(admin_asset))
@@ -105,6 +201,10 @@ pub fn router(state: AppState) -> Router {
             "/api/devices/:device_id/todos/:todo_id",
             put(update_todo).delete(delete_todo),
         )
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            enforce_rate_limit,
+        ))
         .with_state(state)
 }
 
@@ -1269,10 +1369,7 @@ mod tests {
         let db = db::open("sqlite::memory:", 1)
             .await
             .expect("open in-memory db");
-        AppState {
-            db,
-            admin_token: "admin-token-123".to_string(),
-        }
+        AppState::new(db, "admin-token-123".to_string())
     }
 
     fn bearer(token: &str) -> HeaderMap {
