@@ -12,6 +12,20 @@ jobs:
   test:
     name: cargo test + admin-ui build
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: inkwash
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d inkwash"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
 
@@ -31,4 +45,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Test
+        run: cargo test --locked
+
+      - name: Test PostgreSQL
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/inkwash
         run: cargo test --locked
