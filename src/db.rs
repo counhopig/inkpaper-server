@@ -563,6 +563,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_sessions_are_rejected_and_cleaned_up() {
+        let db = test_db().await;
+        let username = format!("expiry-{}", Uuid::new_v4().simple());
+        let account = register_account(&db, &username, "h").await.unwrap();
+        let token = create_session(&db, account.id).await.unwrap();
+        sqlx::query(db.sql(
+            "UPDATE sessions SET expires_at = 0 WHERE token = ?",
+            "UPDATE sessions SET expires_at = 0 WHERE token = $1",
+        ))
+        .bind(&token)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(find_session(&db, &token).await.unwrap(), None);
+        assert_eq!(delete_expired_sessions(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn channel_update_delivery_and_inbox_management() {
         let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();

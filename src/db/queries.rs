@@ -21,6 +21,8 @@ use crate::models::{
     Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
 };
 
+const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+
 fn new_token() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -613,13 +615,15 @@ pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
 /// into an all-rows scan.
 pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
     let token = new_token();
+    let created_at = now_unix();
     sqlx::query(db.sql(
-        "INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)",
-        "INSERT INTO sessions (token, account_id, created_at) VALUES ($1, $2, $3)",
+        "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
     ))
     .bind(&token)
     .bind(account_id)
-    .bind(now_unix())
+    .bind(created_at)
+    .bind(created_at + SESSION_TTL_SECONDS)
     .execute(&db.pool)
     .await?;
     Ok(token)
@@ -628,13 +632,26 @@ pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
 /// Maps a session token to its `account_id`, if valid.
 pub async fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
     let row = sqlx::query(db.sql(
-        "SELECT account_id FROM sessions WHERE token = ?",
-        "SELECT account_id FROM sessions WHERE token = $1",
+        "SELECT account_id FROM sessions WHERE token = ? AND expires_at > ?",
+        "SELECT account_id FROM sessions WHERE token = $1 AND expires_at > $2",
     ))
     .bind(token)
+    .bind(now_unix())
     .fetch_optional(&db.pool)
     .await?;
     Ok(row.map(|r| r.try_get(0)).transpose()?)
+}
+
+/// Removes expired sessions and returns the number of rows deleted.
+pub async fn delete_expired_sessions(db: &Db) -> Result<u64> {
+    let result = sqlx::query(db.sql(
+        "DELETE FROM sessions WHERE expires_at IS NULL OR expires_at <= ?",
+        "DELETE FROM sessions WHERE expires_at IS NULL OR expires_at <= $1",
+    ))
+    .bind(now_unix())
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn delete_session(db: &Db, token: &str) -> Result<()> {

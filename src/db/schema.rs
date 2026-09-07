@@ -296,7 +296,8 @@ const SQLITE_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,

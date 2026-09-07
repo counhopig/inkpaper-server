@@ -43,6 +43,20 @@ async fn main() -> anyhow::Result<()> {
         .context("BIND_ADDR must be a valid host:port")?;
 
     let db = db::open(&db_url, 2).await?;
+    let cleanup_db = db.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            match db::delete_expired_sessions(&cleanup_db).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, "expired console sessions cleaned up")
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!("failed to clean expired console sessions: {err:#}"),
+            }
+        }
+    });
     let state = routes::AppState::new(db, admin_token);
 
     // Deliberately no CORS layer. Every legitimate client is either
