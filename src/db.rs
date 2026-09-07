@@ -320,6 +320,11 @@ mod tests {
         let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
             .unwrap();
+        let version_before_rotate = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
 
         // Wrong device cannot fetch this channel.
         let other = register_device(&db, "other", None).await.unwrap();
@@ -335,6 +340,12 @@ mod tests {
             .unwrap();
         assert!(new_token.starts_with("ipwh_"));
         assert_eq!(new_prefix, new_token.chars().take(12).collect::<String>());
+        let version_after_rotate = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(version_after_rotate, version_before_rotate + 1);
         assert_ne!(
             get_channel(&db, &device.id, &channel.id)
                 .await

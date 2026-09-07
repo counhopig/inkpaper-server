@@ -780,19 +780,22 @@ pub async fn rotate_channel_token(
     device_id: &str,
     channel_id: &str,
 ) -> Result<Option<(String, String)>> {
+    let mut tx = db.pool.begin().await?;
     let row = sqlx::query(db.sql(
         "SELECT kind FROM channels WHERE device_id = ? AND id = ?",
         "SELECT kind FROM channels WHERE device_id = $1 AND id = $2",
     ))
     .bind(device_id)
     .bind(channel_id)
-    .fetch_optional(&db.pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
+        tx.commit().await?;
         return Ok(None);
     };
     let kind: String = row.try_get(0)?;
     if kind != "webhook" {
+        tx.commit().await?;
         return Ok(None);
     }
     let token = new_channel_token();
@@ -808,8 +811,10 @@ pub async fn rotate_channel_token(
     .bind(now_unix())
     .bind(device_id)
     .bind(channel_id)
-    .execute(&db.pool)
+    .execute(&mut *tx)
     .await?;
+    bump_version(db, &mut *tx, device_id).await?;
+    tx.commit().await?;
     Ok(Some((token, prefix)))
 }
 
