@@ -369,7 +369,7 @@ pub enum AuthSubject {
     /// A console-account session token; scoped to the account's own devices.
     Session { account_id: i64 },
     /// A device sync token issued by `register_device`.
-    Device { device_id: String, version: i64 },
+    Device { device_id: String },
     /// A webhook channel token, already verified against the channel named
     /// in the request path (`authenticate` is given `Some(channel_id)`).
     Channel { device_id: String },
@@ -405,7 +405,7 @@ pub async fn authenticate(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "storage error"));
         }
     }
-    if let Some((device_id, version)) =
+    if let Some((device_id, _)) =
         db::find_device_by_token(&state.db, token)
             .await
             .map_err(|err| {
@@ -413,7 +413,7 @@ pub async fn authenticate(
                 (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
             })?
     {
-        return Ok(AuthSubject::Device { device_id, version });
+        return Ok(AuthSubject::Device { device_id });
     }
     if let Some(channel_id) = channel_id {
         if let Some((device_id, token_hash)) = db::get_channel_for_delivery(&state.db, channel_id)
@@ -656,11 +656,15 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
     // Only a device sync token is accepted on this endpoint - admin, session
     // and channel credentials get the same 401 they did from the old bare
     // `find_device_by_token` lookup.
-    let AuthSubject::Device { device_id, version } = subject else {
+    let AuthSubject::Device { device_id, .. } = subject else {
         tracing::warn!("sync rejected: non-device credentials");
         return (StatusCode::UNAUTHORIZED, "unknown device token").into_response();
     };
 
+    let version = match db::device_version(&state.db, &device_id).await {
+        Ok(version) => version,
+        Err(err) => return internal_error(err),
+    };
     let etag = sync_etag(&device_id, version);
     let if_none_match = headers
         .get(axum::http::header::IF_NONE_MATCH)
@@ -717,13 +721,16 @@ async fn device_push_sync(
         return Json(serde_json::json!({ "urgent": urgent })).into_response();
     }
 
-    let version = match db::merge_device_state(&state.db, &device_id, &req).await {
-        Ok(version) => version,
-        Err(err) => return internal_error(err),
-    };
+    if let Err(err) = db::merge_device_state(&state.db, &device_id, &req).await {
+        return internal_error(err);
+    }
     let body = match build_sync_response(&state, &device_id, &req.inbox_read).await {
         Ok(body) => Json(body),
         Err(resp) => return resp.into_response(),
+    };
+    let version = match db::device_version(&state.db, &device_id).await {
+        Ok(version) => version,
+        Err(err) => return internal_error(err),
     };
     let etag = sync_etag(&device_id, version);
     tracing::info!(

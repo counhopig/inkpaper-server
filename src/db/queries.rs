@@ -160,6 +160,20 @@ pub async fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String
         .transpose()
 }
 
+/// Reads the current sync version after a sync response has been assembled.
+/// Callers must not reuse the version captured during authentication because
+/// response construction may itself acknowledge inbox items and bump it.
+pub async fn device_version(db: &Db, device_id: &str) -> Result<i64> {
+    sqlx::query_scalar(db.sql(
+        "SELECT version FROM devices WHERE id = ?",
+        "SELECT version FROM devices WHERE id = $1",
+    ))
+    .bind(device_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Bumps a device's sync version. Callers that combine a write with a bump
 /// must run both inside one `pool.begin()` transaction (see `upsert_alarm`
 /// and friends) so a failed write can't leave a phantom version bump.
