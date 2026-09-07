@@ -16,6 +16,11 @@ pub fn hash_password(password: &str) -> Result<String> {
     Ok(hash.to_string())
 }
 
+/// Runs the memory-hard password hash outside the async executor.
+pub async fn hash_password_async(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password)).await?
+}
+
 /// Returns `true` when `password` matches the stored PHC hash. Always
 /// performs a real verification (against the supplied hash) so username
 /// probing can't be distinguished from a wrong password by timing alone.
@@ -26,6 +31,14 @@ pub fn verify_password(password: &str, stored_hash: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// Runs the memory-hard password verification outside the async executor.
+/// A worker failure is treated like a failed verification.
+pub async fn verify_password_async(password: String, stored_hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &stored_hash))
+        .await
+        .unwrap_or(false)
 }
 
 /// Username rules: 3..=32 chars, `[A-Za-z0-9_-]` only.

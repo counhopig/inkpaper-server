@@ -250,7 +250,7 @@ async fn register_account(State(state): State<AppState>, Json(req): Json<AuthReq
     {
         return (StatusCode::CONFLICT, "username already taken").into_response();
     }
-    let hash = match crate::auth::hash_password(&req.password) {
+    let hash = match crate::auth::hash_password_async(req.password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
@@ -272,7 +272,7 @@ async fn login_account(State(state): State<AppState>, Json(req): Json<AuthReques
     };
     let account_id = match stored {
         Some((id, hash)) => {
-            if !crate::auth::verify_password(&req.password, &hash) {
+            if !crate::auth::verify_password_async(req.password.clone(), hash).await {
                 return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
             }
             id
@@ -280,10 +280,11 @@ async fn login_account(State(state): State<AppState>, Json(req): Json<AuthReques
         None => {
             // Verify against a throwaway hash so unknown usernames cost a
             // real Argon2 round too - no easy user enumeration by timing.
-            let _ = crate::auth::verify_password(
-                &req.password,
-                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            );
+            let _ = crate::auth::verify_password_async(
+                req.password.clone(),
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            )
+            .await;
             return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
         }
     };
@@ -380,13 +381,13 @@ async fn change_password(
         Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
         Err(err) => return internal_error(err),
     };
-    if !crate::auth::verify_password(&req.old_password, &hash) {
+    if !crate::auth::verify_password_async(req.old_password.clone(), hash).await {
         return (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response();
     }
     if let Err(msg) = crate::auth::validate_password(&req.new_password) {
         return bad_request(msg);
     }
-    let new_hash = match crate::auth::hash_password(&req.new_password) {
+    let new_hash = match crate::auth::hash_password_async(req.new_password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
@@ -524,7 +525,7 @@ pub async fn authenticate(
                 (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
             })?
         {
-            if crate::auth::verify_password(token, &token_hash) {
+            if crate::auth::verify_password_async(token.to_string(), token_hash).await {
                 return Ok(AuthSubject::Channel { device_id });
             }
         }
@@ -630,7 +631,7 @@ async fn admin_reset_password(
     if let Err(msg) = crate::auth::validate_password(&req.new_password) {
         return bad_request(msg);
     }
-    let hash = match crate::auth::hash_password(&req.new_password) {
+    let hash = match crate::auth::hash_password_async(req.new_password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
