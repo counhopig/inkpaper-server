@@ -460,8 +460,15 @@ async fn require_device_access(
 }
 
 fn internal_error(err: anyhow::Error) -> Response {
+    // Log the full error internally but return only a generic message to the
+    // client to avoid leaking database details (table/column names, constraint
+    // values, foreign-key references) over the wire.
     tracing::error!("{err:#}");
-    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+    )
+        .into_response()
 }
 
 // --- Admin: account management ---------------------------------------------
