@@ -583,15 +583,43 @@ async fn build_sync_response(
         )
             .into_response());
     }
-    Ok(SyncResponse {
+    let response = SyncResponse {
         alarms,
         todos,
         inbox,
         inbox_read_acked: acked,
         inbox_truncated: truncated,
-    })
+    };
+    // Preflight the firmware's total response buffer (16 KiB PSRAM) — the
+    // sum of all serialized fields must fit or the device truncates the JSON
+    // and reports a misleading parse error. See
+    // `inkwash-firmware/rust-firmware/src/sync.rs:35` (RESPONSE_BUF_LEN).
+    let total_len = serde_json::to_vec(&response)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len();
+    if total_len > SYNC_RESPONSE_BUDGET {
+        tracing::warn!(
+            device_id,
+            total_len,
+            alarm_count = response.alarms.len(),
+            todo_count = response.todos.len(),
+            inbox_count = response.inbox.len(),
+            "sync response exceeds firmware 16KiB buffer"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "sync response payload too large for device buffer",
+        )
+            .into_response());
+    }
+    Ok(response)
 }
 
+/// Firmware's total sync response buffer size (16 KiB PSRAM). See
+/// `inkwash-firmware/rust-firmware/src/sync.rs:35` (RESPONSE_BUF_LEN).
+/// The server preflight-checks the full serialized response against this
+/// so the device never receives a truncated body.
+const SYNC_RESPONSE_BUDGET: usize = 16384;
 /// Firmware NVS storage budget for the alarm list (bytes of serialized JSON).
 /// See `inkwash-firmware/rust-firmware/src/alarms.rs:18` and
 /// `inkwash-firmware/logic/src/sync_validate.rs:100`.
