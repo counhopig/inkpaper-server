@@ -536,16 +536,35 @@ pub async fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> 
     .transpose()
 }
 
-pub async fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
-    sqlx::query(db.sql(
+/// Updates an account password and revokes every existing session in one
+/// transaction. Returns false when the account no longer exists.
+pub async fn update_account_password(
+    db: &Db,
+    account_id: i64,
+    password_hash: &str,
+) -> Result<bool> {
+    let mut tx = db.pool.begin().await?;
+    let updated = sqlx::query(db.sql(
         "UPDATE accounts SET password_hash = ? WHERE id = ?",
         "UPDATE accounts SET password_hash = $1 WHERE id = $2",
     ))
     .bind(password_hash)
     .bind(account_id)
-    .execute(&db.pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    if updated.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(db.sql(
+        "DELETE FROM sessions WHERE account_id = ?",
+        "DELETE FROM sessions WHERE account_id = $1",
+    ))
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Admin-only listing of every account with its device/session counts.

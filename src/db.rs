@@ -502,9 +502,12 @@ mod tests {
         // account_by_id / update_account_password roundtrip.
         let fetched = account_by_id(&db, account.id).await.unwrap().unwrap();
         assert_eq!(fetched.username, username);
-        update_account_password(&db, account.id, "hash-2")
+        let session = create_session(&db, account.id).await.unwrap();
+        assert_eq!(find_session(&db, &session).await.unwrap(), Some(account.id));
+        assert!(update_account_password(&db, account.id, "hash-2")
             .await
-            .unwrap();
+            .unwrap());
+        assert_eq!(find_session(&db, &session).await.unwrap(), None);
         let (_, password_hash) = find_account_by_username(&db, &username)
             .await
             .unwrap()

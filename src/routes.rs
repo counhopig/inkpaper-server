@@ -291,7 +291,8 @@ async fn change_password(
         Err(err) => return internal_error(err),
     };
     match db::update_account_password(&state.db, account_id, &new_hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
         Err(err) => internal_error(err),
     }
 }
@@ -534,7 +535,8 @@ async fn admin_reset_password(
         Err(err) => return internal_error(err),
     };
     match db::update_account_password(&state.db, account_id, &hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
         Err(err) => internal_error(err),
     }
 }
