@@ -533,6 +533,12 @@ async fn admin_reset_password(
 
 /// Builds the sync payload (alarms/todos + capped inbox). Reuses the inbox
 /// read-merge so the `inbox_read` upload is folded into the response.
+///
+/// Preflight-checks the serialized alarm and todo lists against the
+/// firmware's fixed NVS capacities (alarms 1024 bytes, todos 2048 bytes)
+/// — the same limits enforced by `inkwash-firmware/logic/src/sync_validate.rs`
+/// `validate_sync_response`. Without this, a device that can never fit the
+/// response will silently reject every sync, losing all new data.
 async fn build_sync_response(
     state: &AppState,
     device_id: &str,
@@ -550,6 +556,33 @@ async fn build_sync_response(
     let (inbox, truncated) = db::list_inbox(&state.db, device_id, INBOX_LIMIT)
         .await
         .map_err(internal_error)?;
+    // Preflight firmware NVS capacity — if the serialized list won't fit,
+    // reject now with a 409 Conflict instead of sending a response the
+    // device will reject and stall on.
+    if serde_json::to_vec(&alarms)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len()
+        > ALARM_NVS_CAPACITY
+    {
+        tracing::warn!(device_id, alarm_count = alarms.len(), "alarm list exceeds device NVS capacity");
+        return Err((
+            StatusCode::CONFLICT,
+            "alarm list exceeds device storage capacity",
+        )
+            .into_response());
+    }
+    if serde_json::to_vec(&todos)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len()
+        > TODO_NVS_CAPACITY
+    {
+        tracing::warn!(device_id, todo_count = todos.len(), "todo list exceeds device NVS capacity");
+        return Err((
+            StatusCode::CONFLICT,
+            "todo list exceeds device storage capacity",
+        )
+            .into_response());
+    }
     Ok(SyncResponse {
         alarms,
         todos,
@@ -558,6 +591,15 @@ async fn build_sync_response(
         inbox_truncated: truncated,
     })
 }
+
+/// Firmware NVS storage budget for the alarm list (bytes of serialized JSON).
+/// See `inkwash-firmware/rust-firmware/src/alarms.rs:18` and
+/// `inkwash-firmware/logic/src/sync_validate.rs:100`.
+const ALARM_NVS_CAPACITY: usize = 1024;
+/// Firmware NVS storage budget for the todo list (bytes of serialized JSON).
+/// See `inkwash-firmware/rust-firmware/src/todos.rs:20` and
+/// `inkwash-firmware/logic/src/sync_validate.rs:110`.
+const TODO_NVS_CAPACITY: usize = 2048;
 
 /// Max inbox items sent to the device in one sync response (hard capacity).
 const INBOX_LIMIT: usize = 20;
@@ -1389,5 +1431,27 @@ mod tests {
             repeat: Some(crate::models::Repeat::Weekly { days: vec![1, 3, 5] }),
         };
         assert!(validate_todo(&good).is_ok());
+    }
+
+    /// build_sync_response rejects payloads that would exceed firmware NVS
+    /// capacity before the device ever sees them.
+    #[tokio::test]
+    async fn build_sync_response_rejects_oversized_alarm_list() {
+        let state = test_state().await;
+        let device = db::register_device(&state.db, "clock", None).await.unwrap();
+        // 3 alarms with 300-byte labels = >1024 serialized bytes.
+        let big_label = "Z".repeat(300);
+        for _ in 0..3 {
+            let req = UpsertAlarmRequest {
+                hour: 7,
+                minute: 0,
+                repeat: crate::models::Repeat::Daily,
+                enabled: true,
+                label: big_label.clone(),
+            };
+            db::upsert_alarm(&state.db, &device.id, None, &req).await.unwrap();
+        }
+        let result = build_sync_response(&state, &device.id, &[]).await;
+        assert!(result.is_err(), "expected NVS capacity pre-check to reject oversized alarm list");
     }
 }
