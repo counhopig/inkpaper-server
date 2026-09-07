@@ -594,6 +594,9 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "new");
         assert!(!updated.enabled);
+        update_channel(&db, &device.id, &channel.id, None, Some(true))
+            .await
+            .unwrap();
 
         // delete_inbox_item removes one seq; clear_read_inbox drops read ones.
         let (seq1, _) = deliver_inbox(

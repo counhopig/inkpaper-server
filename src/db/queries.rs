@@ -846,6 +846,18 @@ pub async fn rotate_channel_token(
     channel_id: &str,
 ) -> Result<Option<(String, String)>> {
     let mut tx = db.pool.begin().await?;
+    let channel_lock = sqlx::query(db.sql(
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ?",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    if channel_lock.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
     let row = sqlx::query(db.sql(
         "SELECT kind FROM channels WHERE device_id = ? AND id = ?",
         "SELECT kind FROM channels WHERE device_id = $1 AND id = $2",
@@ -979,8 +991,8 @@ pub async fn deliver_inbox(
 ) -> Result<(u64, bool)> {
     let mut tx = db.pool.begin().await?;
     let channel_lock = sqlx::query(db.sql(
-        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ?",
-        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ? AND enabled = 1",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2 AND enabled = 1",
     ))
     .bind(device_id)
     .bind(channel_id)
