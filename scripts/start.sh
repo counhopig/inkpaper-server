@@ -52,6 +52,10 @@ EOF
   fi
 fi
 
+# The file contains the admin bearer token; keep it readable only by the
+# account running the server, including when an existing file is reused.
+chmod 600 "$ENV_FILE"
+
 ADMIN_UI_DIR="$PROJECT_ROOT/admin-ui"
 if [[ ! -d "$ADMIN_UI_DIR/node_modules" ]]; then
   echo "installing admin-ui dependencies (one-time)..."
