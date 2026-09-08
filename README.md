@@ -1,5 +1,7 @@
 # Inkwash Server
 
+Current release: **v0.6.0**.
+
 Personal-scale cloud backend for the **Zectrix Note 4** e-ink device —
 stores alarms and todos per device and serves them over the sync contract.
 Part of the [**Inkwash**](https://github.com/counhopig/inkwash-firmware)

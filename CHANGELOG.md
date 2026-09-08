@@ -3,6 +3,14 @@
 All notable changes to **inkwash-server** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+
+## [0.6.0] - 2026-09-08
+
+### Changed
+- Version aligned with the Inkwash v0.6.0 release across the server,
+  desktop, MCP, and firmware repositories.
+- The existing pinned `inkwash-logic` revision and sync wire-contract
+  fixtures remain in use.
 ## [0.5.0] - 2026-08-27
 
 ### Changed

@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Current release: v0.6.0 (2026-09-08).
+
 Personal-scale device-cloud backend in Rust + axum: an admin API guarded by the single `ADMIN_TOKEN` **plus** console-account sessions (`POST /api/auth/*`, Argon2id passwords, per-account device ownership), and a device-facing sync endpoint `/api/sync` (per-device tokens, ETag/304 caching). Storage is sqlx's `Any` driver: SQLite by default (zero-config), or PostgreSQL when `DATABASE_URL` is a `postgres://` URL. The Vue 3 console `admin-ui/` is embedded into the binary at compile time via rust-embed. One of four repos: firmware + protocol docs live in `../inkwash-firmware`, the desktop tool in `../inkwash-desktop`, the MCP server in `../inkwash-mcp`.
 
 ## Critical gotchas
