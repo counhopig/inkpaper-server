@@ -304,12 +304,13 @@ mod wire_contract_tests {
         assert_eq!(parsed.alarms[0].label, "Morning");
         assert!(matches!(
             parsed.alarms[1].repeat,
-            Repeat::Once { year: 2026, month: 12, day: 25 }
+            Repeat::Once {
+                year: 2026,
+                month: 12,
+                day: 25
+            }
         ));
-        assert!(matches!(
-            parsed.alarms[2].repeat,
-            Repeat::Weekly { .. }
-        ));
+        assert!(matches!(parsed.alarms[2].repeat, Repeat::Weekly { .. }));
         if let Repeat::Weekly { days } = &parsed.alarms[2].repeat {
             assert_eq!(days, &vec![0u8, 2, 4]);
         }
@@ -322,7 +323,14 @@ mod wire_contract_tests {
         assert!(parsed.todos[0].repeat.is_none());
         assert!(parsed.todos[1].done);
         assert_eq!(parsed.todos[1].importance, Importance::High);
-        assert_eq!(parsed.todos[1].due_date, Some(TodoDue { year: 2026, month: 8, day: 19 }));
+        assert_eq!(
+            parsed.todos[1].due_date,
+            Some(TodoDue {
+                year: 2026,
+                month: 8,
+                day: 19
+            })
+        );
         assert!(matches!(
             parsed.todos[1].repeat,
             Some(Repeat::Monthly { .. })
@@ -379,9 +387,10 @@ mod wire_contract_tests {
             inbox_truncated: true,
         };
 
-        let serialized = serde_json::to_value(&server_view).expect("server SyncResponse must serialize");
-        let parsed: LogicSyncResponse =
-            serde_json::from_value(serialized.clone()).expect("server output must parse as firmware SyncResponse");
+        let serialized =
+            serde_json::to_value(&server_view).expect("server SyncResponse must serialize");
+        let parsed: LogicSyncResponse = serde_json::from_value(serialized.clone())
+            .expect("server output must parse as firmware SyncResponse");
 
         assert_eq!(parsed.alarms.len(), 1);
         assert_eq!(parsed.alarms[0].id, 3);
@@ -402,7 +411,13 @@ mod wire_contract_tests {
 
         // Documented top-level keys must be present in the serialized form.
         let obj = serialized.as_object().expect("sync response is an object");
-        for key in ["alarms", "todos", "inbox", "inbox_read_acked", "inbox_truncated"] {
+        for key in [
+            "alarms",
+            "todos",
+            "inbox",
+            "inbox_read_acked",
+            "inbox_truncated",
+        ] {
             assert!(obj.contains_key(key), "missing documented key {key}");
         }
         // Every serialized alarm carries the full documented field set.

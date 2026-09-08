@@ -27,9 +27,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use inkwash_logic::sync_validate::{validate_date, validate_repeat};
 use rust_embed::RustEmbed;
 use subtle::ConstantTimeEq;
-use inkwash_logic::sync_validate::{validate_date, validate_repeat};
 
 use crate::db::{self, Db};
 use crate::models::{
@@ -418,8 +418,7 @@ fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), String> {
     if req.label.chars().count() > 40 {
         return Err("alarm label must be at most 40 characters".to_string());
     }
-    validate_repeat(&req.repeat)
-        .map_err(|err| format!("invalid repeat rule: {err}"))
+    validate_repeat(&req.repeat).map_err(|err| format!("invalid repeat rule: {err}"))
 }
 
 /// Validates a todo against the firmware's date/repeat rules
@@ -442,10 +441,11 @@ fn validate_todo(req: &UpsertTodoRequest) -> Result<(), String> {
     }
     if let Some(repeat) = &req.repeat {
         if matches!(repeat, crate::models::Repeat::Once { .. }) {
-            return Err("todo repeat Once is not supported; use due_date for a single due date".to_string());
+            return Err(
+                "todo repeat Once is not supported; use due_date for a single due date".to_string(),
+            );
         }
-        validate_repeat(repeat)
-            .map_err(|err| format!("invalid repeat rule: {err}"))?;
+        validate_repeat(repeat).map_err(|err| format!("invalid repeat rule: {err}"))?;
     }
     Ok(())
 }
@@ -569,11 +569,7 @@ fn internal_error(err: anyhow::Error) -> Response {
     // client to avoid leaking database details (table/column names, constraint
     // values, foreign-key references) over the wire.
     tracing::error!("{err:#}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "Internal server error",
-    )
-        .into_response()
+    (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
 }
 
 // --- Admin: account management ---------------------------------------------
@@ -677,7 +673,11 @@ async fn build_sync_response(
         .len()
         > ALARM_NVS_CAPACITY
     {
-        tracing::warn!(device_id, alarm_count = alarms.len(), "alarm list exceeds device NVS capacity");
+        tracing::warn!(
+            device_id,
+            alarm_count = alarms.len(),
+            "alarm list exceeds device NVS capacity"
+        );
         return Err((
             StatusCode::CONFLICT,
             "alarm list exceeds device storage capacity",
@@ -689,7 +689,11 @@ async fn build_sync_response(
         .len()
         > TODO_NVS_CAPACITY
     {
-        tracing::warn!(device_id, todo_count = todos.len(), "todo list exceeds device NVS capacity");
+        tracing::warn!(
+            device_id,
+            todo_count = todos.len(),
+            "todo list exceeds device NVS capacity"
+        );
         return Err((
             StatusCode::CONFLICT,
             "todo list exceeds device storage capacity",
@@ -1508,7 +1512,11 @@ mod tests {
         let bad_once = UpsertAlarmRequest {
             hour: 10,
             minute: 0,
-            repeat: crate::models::Repeat::Once { year: 2026, month: 2, day: 31 },
+            repeat: crate::models::Repeat::Once {
+                year: 2026,
+                month: 2,
+                day: 31,
+            },
             enabled: true,
             label: "Bad once".into(),
         };
@@ -1518,7 +1526,11 @@ mod tests {
         let bad_year = UpsertAlarmRequest {
             hour: 10,
             minute: 0,
-            repeat: crate::models::Repeat::Once { year: 1999, month: 12, day: 25 },
+            repeat: crate::models::Repeat::Once {
+                year: 1999,
+                month: 12,
+                day: 25,
+            },
             enabled: true,
             label: "Bad year".into(),
         };
@@ -1528,7 +1540,11 @@ mod tests {
         let good = UpsertAlarmRequest {
             hour: 7,
             minute: 30,
-            repeat: crate::models::Repeat::Once { year: 2026, month: 12, day: 25 },
+            repeat: crate::models::Repeat::Once {
+                year: 2026,
+                month: 12,
+                day: 25,
+            },
             enabled: true,
             label: "Christmas".into(),
         };
@@ -1543,7 +1559,11 @@ mod tests {
             done: false,
             importance: crate::models::Importance::Medium,
             due_date: None,
-            repeat: Some(crate::models::Repeat::Once { year: 2026, month: 6, day: 1 }),
+            repeat: Some(crate::models::Repeat::Once {
+                year: 2026,
+                month: 6,
+                day: 1,
+            }),
         };
         assert!(validate_todo(&once_repeat).is_err());
 
@@ -1552,7 +1572,11 @@ mod tests {
             text: "Bad due".into(),
             done: false,
             importance: crate::models::Importance::Medium,
-            due_date: Some(crate::models::TodoDue { year: 2026, month: 4, day: 31 }),
+            due_date: Some(crate::models::TodoDue {
+                year: 2026,
+                month: 4,
+                day: 31,
+            }),
             repeat: None,
         };
         assert!(validate_todo(&bad_due).is_err());
@@ -1572,8 +1596,14 @@ mod tests {
             text: "Weekly review".into(),
             done: false,
             importance: crate::models::Importance::High,
-            due_date: Some(crate::models::TodoDue { year: 2026, month: 8, day: 19 }),
-            repeat: Some(crate::models::Repeat::Weekly { days: vec![1, 3, 5] }),
+            due_date: Some(crate::models::TodoDue {
+                year: 2026,
+                month: 8,
+                day: 19,
+            }),
+            repeat: Some(crate::models::Repeat::Weekly {
+                days: vec![1, 3, 5],
+            }),
         };
         assert!(validate_todo(&good).is_ok());
     }
@@ -1594,9 +1624,14 @@ mod tests {
                 enabled: true,
                 label: big_label.clone(),
             };
-            db::upsert_alarm(&state.db, &device.id, None, &req).await.unwrap();
+            db::upsert_alarm(&state.db, &device.id, None, &req)
+                .await
+                .unwrap();
         }
         let result = build_sync_response(&state, &device.id, &[]).await;
-        assert!(result.is_err(), "expected NVS capacity pre-check to reject oversized alarm list");
+        assert!(
+            result.is_err(),
+            "expected NVS capacity pre-check to reject oversized alarm list"
+        );
     }
 }
