@@ -320,6 +320,11 @@ mod tests {
         let (channel, _) = create_channel(&db, &device.id, "webhook", "CI", None)
             .await
             .unwrap();
+        let version_before_rotate = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
 
         // Wrong device cannot fetch this channel.
         let other = register_device(&db, "other", None).await.unwrap();
@@ -335,6 +340,12 @@ mod tests {
             .unwrap();
         assert!(new_token.starts_with("ipwh_"));
         assert_eq!(new_prefix, new_token.chars().take(12).collect::<String>());
+        let version_after_rotate = find_device_by_token(&db, device.token.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(version_after_rotate, version_before_rotate + 1);
         assert_ne!(
             get_channel(&db, &device.id, &channel.id)
                 .await
@@ -482,6 +493,91 @@ mod tests {
             .1;
         assert_eq!(after, before, "version must not advance on a failed write");
     }
+
+    #[tokio::test]
+    async fn local_ids_are_not_reused_after_delete_or_clear() {
+        let db = test_db().await;
+        let device = register_device(&db, "id-history", None).await.unwrap();
+        let request = |label: &str| UpsertAlarmRequest {
+            hour: 7,
+            minute: 0,
+            repeat: Repeat::Daily,
+            enabled: true,
+            label: label.to_string(),
+        };
+
+        // A high explicit id must not make the allocator report capacity
+        // exhausted while lower slots are still available.
+        let high = upsert_alarm(&db, &device.id, Some(255), &request("high"))
+            .await
+            .unwrap();
+        assert_eq!(high, 255);
+        let first = upsert_alarm(&db, &device.id, None, &request("first"))
+            .await
+            .unwrap();
+        assert_eq!(first, 0);
+
+        // The deleted high id remains reserved, so it cannot receive a
+        // stale enabled flag from the device while a replacement is absent.
+        delete_alarm(&db, &device.id, high).await.unwrap();
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![crate::models::DeviceAlarmState {
+                    id: high,
+                    enabled: false,
+                }],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let second = upsert_alarm(&db, &device.id, None, &request("second"))
+            .await
+            .unwrap();
+        assert_eq!(second, 1);
+
+        // Clearing the visible list also keeps its ids reserved. The next
+        // allocation advances to a never-used slot instead of reusing 0.
+        clear_alarms(&db, &device.id).await.unwrap();
+        let third = upsert_alarm(&db, &device.id, None, &request("third"))
+            .await
+            .unwrap();
+        assert_eq!(third, 2);
+
+        // Once a sync arrives without the deleted ids, the device has
+        // observed the authoritative list and those slots can be reclaimed.
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        clear_alarms(&db, &device.id).await.unwrap();
+        merge_device_state(
+            &db,
+            &device.id,
+            &DeviceSyncRequest {
+                alarms: vec![],
+                todos: vec![],
+                inbox_read: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let reclaimed = upsert_alarm(&db, &device.id, None, &request("reclaimed"))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 0);
+    }
+
     #[tokio::test]
     async fn alarm_todo_delete_and_account_updates() {
         let db = test_db().await;
@@ -491,9 +587,12 @@ mod tests {
         // account_by_id / update_account_password roundtrip.
         let fetched = account_by_id(&db, account.id).await.unwrap().unwrap();
         assert_eq!(fetched.username, username);
-        update_account_password(&db, account.id, "hash-2")
+        let session = create_session(&db, account.id).await.unwrap();
+        assert_eq!(find_session(&db, &session).await.unwrap(), Some(account.id));
+        assert!(update_account_password(&db, account.id, "hash-2")
             .await
-            .unwrap();
+            .unwrap());
+        assert_eq!(find_session(&db, &session).await.unwrap(), None);
         let (_, password_hash) = find_account_by_username(&db, &username)
             .await
             .unwrap()
@@ -549,6 +648,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_sessions_are_rejected_and_cleaned_up() {
+        let db = test_db().await;
+        let username = format!("expiry-{}", Uuid::new_v4().simple());
+        let account = register_account(&db, &username, "h").await.unwrap();
+        let token = create_session(&db, account.id).await.unwrap();
+        sqlx::query(db.sql(
+            "UPDATE sessions SET expires_at = 0 WHERE token = ?",
+            "UPDATE sessions SET expires_at = 0 WHERE token = $1",
+        ))
+        .bind(&token)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(find_session(&db, &token).await.unwrap(), None);
+        assert_eq!(delete_expired_sessions(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn channel_update_delivery_and_inbox_management() {
         let db = test_db().await;
         let device = register_device(&db, "dev", None).await.unwrap();
@@ -580,6 +698,9 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "new");
         assert!(!updated.enabled);
+        update_channel(&db, &device.id, &channel.id, None, Some(true))
+            .await
+            .unwrap();
 
         // delete_inbox_item removes one seq; clear_read_inbox drops read ones.
         let (seq1, _) = deliver_inbox(

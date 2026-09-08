@@ -12,7 +12,7 @@
 use anyhow::{anyhow, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use sqlx::{Any, Executor, Row};
+use sqlx::{Any, Executor, Row, Transaction};
 use uuid::Uuid;
 
 use super::Db;
@@ -20,6 +20,8 @@ use crate::models::{
     Account, AccountSummary, Alarm, Channel, Device, Importance, InboxItem, InboxKind, Priority,
     Repeat, Todo, UpsertAlarmRequest, UpsertTodoRequest,
 };
+
+const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 fn new_token() -> String {
     rand::thread_rng()
@@ -160,6 +162,20 @@ pub async fn find_device_by_token(db: &Db, token: &str) -> Result<Option<(String
         .transpose()
 }
 
+/// Reads the current sync version after a sync response has been assembled.
+/// Callers must not reuse the version captured during authentication because
+/// response construction may itself acknowledge inbox items and bump it.
+pub async fn device_version(db: &Db, device_id: &str) -> Result<i64> {
+    sqlx::query_scalar(db.sql(
+        "SELECT version FROM devices WHERE id = ?",
+        "SELECT version FROM devices WHERE id = $1",
+    ))
+    .bind(device_id)
+    .fetch_one(&db.pool)
+    .await
+    .map_err(Into::into)
+}
+
 /// Bumps a device's sync version. Callers that combine a write with a bump
 /// must run both inside one `pool.begin()` transaction (see `upsert_alarm`
 /// and friends) so a failed write can't leave a phantom version bump.
@@ -257,21 +273,125 @@ pub async fn list_todos(db: &Db, device_id: &str) -> Result<Vec<Todo>> {
         .collect()
 }
 
-async fn next_local_id<'e, E>(db: &Db, executor: E, table: &str, device_id: &str) -> Result<u8>
+/// Allocates the first wire-compatible id that has never been assigned to
+/// this device/list. Deleted ids stay in `device_local_ids`: the device may
+/// still have a dirty copy of one while it is waiting to receive the next
+/// authoritative sync response, so reusing it could apply stale state to a
+/// different record.
+async fn next_local_id<'e, E>(db: &Db, executor: E, kind: &str, device_id: &str) -> Result<u8>
 where
     E: Executor<'e, Database = Any>,
 {
-    let sql = if db.postgres {
-        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = $1")
-    } else {
-        format!("SELECT MAX(local_id) FROM {table} WHERE device_id = ?")
-    };
-    let max: Option<i64> = sqlx::query_scalar(&sql)
-        .bind(device_id)
-        .fetch_one(executor)
-        .await?;
-    let next = max.map(|m| m + 1).unwrap_or(0);
-    u8::try_from(next).map_err(|_| anyhow!("device has reached the 256-alarm/todo id limit"))
+    let rows = sqlx::query(db.sql(
+        "SELECT local_id FROM device_local_ids WHERE device_id = ? AND kind = ?",
+        "SELECT local_id FROM device_local_ids WHERE device_id = $1 AND kind = $2",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .fetch_all(executor)
+    .await?;
+    let mut used = [false; 256];
+    for row in rows {
+        if let Ok(id) = usize::try_from(row.try_get::<i64, _>(0)?) {
+            if id < used.len() {
+                used[id] = true;
+            }
+        }
+    }
+    used.iter()
+        .position(|assigned| !assigned)
+        .and_then(|id| u8::try_from(id).ok())
+        .ok_or_else(|| anyhow!("device has reached the 256-alarm/todo id limit"))
+}
+
+async fn reserve_local_id(
+    db: &Db,
+    tx: &mut Transaction<'_, Any>,
+    device_id: &str,
+    kind: &str,
+    id: u8,
+) -> Result<()> {
+    let released: Option<i64> = sqlx::query_scalar(db.sql(
+        "SELECT released FROM device_local_ids WHERE device_id = ? AND kind = ? AND local_id = ?",
+        "SELECT released FROM device_local_ids WHERE device_id = $1 AND kind = $2 AND local_id = $3",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if released == Some(1) {
+        return Err(anyhow!("local id is awaiting device sync confirmation"));
+    }
+    sqlx::query(db.sql(
+        "INSERT INTO device_local_ids (device_id, kind, local_id, released) VALUES (?, ?, ?, 0) ON CONFLICT(device_id, kind, local_id) DO NOTHING",
+        "INSERT INTO device_local_ids (device_id, kind, local_id, released) VALUES ($1, $2, $3, 0) ON CONFLICT(device_id, kind, local_id) DO NOTHING",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn release_confirmed_local_ids(
+    db: &Db,
+    tx: &mut Transaction<'_, Any>,
+    device_id: &str,
+    kind: &str,
+    uploaded_ids: &[u8],
+) -> Result<()> {
+    let mut sql = format!(
+        "DELETE FROM device_local_ids WHERE device_id = {} AND kind = {} AND released = {}",
+        if db.postgres { "$1" } else { "?" },
+        if db.postgres { "$2" } else { "?" },
+        if db.postgres { "$3" } else { "?" },
+    );
+    if !uploaded_ids.is_empty() {
+        let placeholders = (0..uploaded_ids.len())
+            .map(|index| {
+                if db.postgres {
+                    format!("${}", index + 4)
+                } else {
+                    "?".to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&format!(" AND local_id NOT IN ({placeholders})"));
+    }
+    let mut query = sqlx::query(&sql).bind(device_id).bind(kind).bind(1_i64);
+    for id in uploaded_ids {
+        query = query.bind(*id as i64);
+    }
+    query.execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Takes the SQLite writer lock before reading the allocation history. A
+/// deferred transaction would let concurrent upserts observe the same free
+/// slot and then race while upgrading to a writer; serializing on the device
+/// row keeps the allocation and insert in one lock-protected transaction.
+pub(crate) async fn lock_device_for_write<'e, E>(
+    db: &Db,
+    executor: E,
+    device_id: &str,
+) -> Result<()>
+where
+    E: Executor<'e, Database = Any>,
+{
+    let result = sqlx::query(db.sql(
+        "UPDATE devices SET version = version WHERE id = ?",
+        "UPDATE devices SET version = version WHERE id = $1",
+    ))
+    .bind(device_id)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(anyhow!("device not found"));
+    }
+    Ok(())
 }
 
 /// Creates a new alarm (`id: None`) or replaces an existing one (`id:
@@ -285,10 +405,12 @@ pub async fn upsert_alarm(
     req: &UpsertAlarmRequest,
 ) -> Result<u8> {
     let mut tx = db.pool.begin().await?;
+    lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
-        None => next_local_id(db, &mut *tx, "alarms", device_id).await?,
+        None => next_local_id(db, &mut *tx, "alarm", device_id).await?,
     };
+    reserve_local_id(db, &mut tx, device_id, "alarm", id).await?;
     let (repeat_kind, once_year, once_month, once_day, repeat_days) =
         repeat_to_columns(&req.repeat);
     sqlx::query(db.sql(
@@ -340,10 +462,12 @@ pub async fn upsert_todo(
     req: &UpsertTodoRequest,
 ) -> Result<u8> {
     let mut tx = db.pool.begin().await?;
+    lock_device_for_write(db, &mut *tx, device_id).await?;
     let id = match id {
         Some(id) => id,
-        None => next_local_id(db, &mut *tx, "todos", device_id).await?,
+        None => next_local_id(db, &mut *tx, "todo", device_id).await?,
     };
+    reserve_local_id(db, &mut tx, device_id, "todo", id).await?;
     let (due_year, due_month, due_day) = match req.due_date {
         Some(due) => (
             Some(due.year as i64),
@@ -407,6 +531,11 @@ pub async fn clear_todos(db: &Db, device_id: &str) -> Result<()> {
 /// `format!` here is safe (same pattern already used by `next_local_id`).
 async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Result<()> {
     let mut tx = db.pool.begin().await?;
+    let kind = match table {
+        "alarms" => "alarm",
+        "todos" => "todo",
+        _ => unreachable!("delete_local_id only accepts alarm/todo tables"),
+    };
     let sql = if db.postgres {
         format!("DELETE FROM {table} WHERE device_id = $1 AND local_id = $2")
     } else {
@@ -417,6 +546,15 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
         .bind(id as i64)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(db.sql(
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = ? AND kind = ? AND local_id = ?",
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = $1 AND kind = $2 AND local_id = $3",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .bind(id as i64)
+    .execute(&mut *tx)
+    .await?;
     bump_version(db, &mut *tx, device_id).await?;
     tx.commit().await?;
     Ok(())
@@ -427,12 +565,25 @@ async fn delete_local_id(db: &Db, table: &str, device_id: &str, id: u8) -> Resul
 /// `clear_todos` - see `delete_local_id` for why the `format!` here is safe.
 async fn clear_table(db: &Db, table: &str, device_id: &str) -> Result<()> {
     let mut tx = db.pool.begin().await?;
+    let kind = match table {
+        "alarms" => "alarm",
+        "todos" => "todo",
+        _ => unreachable!("clear_table only accepts alarm/todo tables"),
+    };
     let sql = if db.postgres {
         format!("DELETE FROM {table} WHERE device_id = $1")
     } else {
         format!("DELETE FROM {table} WHERE device_id = ?")
     };
     sqlx::query(&sql).bind(device_id).execute(&mut *tx).await?;
+    sqlx::query(db.sql(
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = ? AND kind = ?",
+        "UPDATE device_local_ids SET released = 1 WHERE device_id = $1 AND kind = $2",
+    ))
+    .bind(device_id)
+    .bind(kind)
+    .execute(&mut *tx)
+    .await?;
     bump_version(db, &mut *tx, device_id).await?;
     tx.commit().await?;
     Ok(())
@@ -455,6 +606,15 @@ pub async fn register_account(db: &Db, username: &str, password_hash: &str) -> R
         username: username.to_string(),
         created_at: now_unix(),
     })
+}
+
+/// Returns whether an anyhow-wrapped SQLx error is a backend unique-key
+/// violation. Routes use this to turn concurrent registration conflicts into
+/// the documented 409 response instead of a generic 500.
+pub fn is_unique_violation(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<sqlx::Error>()
+        .and_then(sqlx::Error::as_database_error)
+        .is_some_and(|db_err| db_err.is_unique_violation())
 }
 
 /// Returns `(account_id, password_hash)` for a username, if it exists.
@@ -490,16 +650,35 @@ pub async fn account_by_id(db: &Db, account_id: i64) -> Result<Option<Account>> 
     .transpose()
 }
 
-pub async fn update_account_password(db: &Db, account_id: i64, password_hash: &str) -> Result<()> {
-    sqlx::query(db.sql(
+/// Updates an account password and revokes every existing session in one
+/// transaction. Returns false when the account no longer exists.
+pub async fn update_account_password(
+    db: &Db,
+    account_id: i64,
+    password_hash: &str,
+) -> Result<bool> {
+    let mut tx = db.pool.begin().await?;
+    let updated = sqlx::query(db.sql(
         "UPDATE accounts SET password_hash = ? WHERE id = ?",
         "UPDATE accounts SET password_hash = $1 WHERE id = $2",
     ))
     .bind(password_hash)
     .bind(account_id)
-    .execute(&db.pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    if updated.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    sqlx::query(db.sql(
+        "DELETE FROM sessions WHERE account_id = ?",
+        "DELETE FROM sessions WHERE account_id = $1",
+    ))
+    .bind(account_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Admin-only listing of every account with its device/session counts.
@@ -548,13 +727,15 @@ pub async fn delete_account(db: &Db, account_id: i64) -> Result<bool> {
 /// into an all-rows scan.
 pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
     let token = new_token();
+    let created_at = now_unix();
     sqlx::query(db.sql(
-        "INSERT INTO sessions (token, account_id, created_at) VALUES (?, ?, ?)",
-        "INSERT INTO sessions (token, account_id, created_at) VALUES ($1, $2, $3)",
+        "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO sessions (token, account_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
     ))
     .bind(&token)
     .bind(account_id)
-    .bind(now_unix())
+    .bind(created_at)
+    .bind(created_at + SESSION_TTL_SECONDS)
     .execute(&db.pool)
     .await?;
     Ok(token)
@@ -563,13 +744,26 @@ pub async fn create_session(db: &Db, account_id: i64) -> Result<String> {
 /// Maps a session token to its `account_id`, if valid.
 pub async fn find_session(db: &Db, token: &str) -> Result<Option<i64>> {
     let row = sqlx::query(db.sql(
-        "SELECT account_id FROM sessions WHERE token = ?",
-        "SELECT account_id FROM sessions WHERE token = $1",
+        "SELECT account_id FROM sessions WHERE token = ? AND expires_at > ?",
+        "SELECT account_id FROM sessions WHERE token = $1 AND expires_at > $2",
     ))
     .bind(token)
+    .bind(now_unix())
     .fetch_optional(&db.pool)
     .await?;
     Ok(row.map(|r| r.try_get(0)).transpose()?)
+}
+
+/// Removes expired sessions and returns the number of rows deleted.
+pub async fn delete_expired_sessions(db: &Db) -> Result<u64> {
+    let result = sqlx::query(db.sql(
+        "DELETE FROM sessions WHERE expires_at IS NULL OR expires_at <= ?",
+        "DELETE FROM sessions WHERE expires_at IS NULL OR expires_at <= $1",
+    ))
+    .bind(now_unix())
+    .execute(&db.pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 pub async fn delete_session(db: &Db, token: &str) -> Result<()> {
@@ -780,19 +974,34 @@ pub async fn rotate_channel_token(
     device_id: &str,
     channel_id: &str,
 ) -> Result<Option<(String, String)>> {
+    let mut tx = db.pool.begin().await?;
+    let channel_lock = sqlx::query(db.sql(
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ?",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    if channel_lock.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
     let row = sqlx::query(db.sql(
         "SELECT kind FROM channels WHERE device_id = ? AND id = ?",
         "SELECT kind FROM channels WHERE device_id = $1 AND id = $2",
     ))
     .bind(device_id)
     .bind(channel_id)
-    .fetch_optional(&db.pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
+        tx.commit().await?;
         return Ok(None);
     };
     let kind: String = row.try_get(0)?;
     if kind != "webhook" {
+        tx.commit().await?;
         return Ok(None);
     }
     let token = new_channel_token();
@@ -808,8 +1017,10 @@ pub async fn rotate_channel_token(
     .bind(now_unix())
     .bind(device_id)
     .bind(channel_id)
-    .execute(&db.pool)
+    .execute(&mut *tx)
     .await?;
+    bump_version(db, &mut *tx, device_id).await?;
+    tx.commit().await?;
     Ok(Some((token, prefix)))
 }
 
@@ -908,6 +1119,17 @@ pub async fn deliver_inbox(
     source_ref: Option<&str>,
 ) -> Result<(u64, bool)> {
     let mut tx = db.pool.begin().await?;
+    let channel_lock = sqlx::query(db.sql(
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = ? AND id = ? AND enabled = 1",
+        "UPDATE channels SET updated_at = updated_at WHERE device_id = $1 AND id = $2 AND enabled = 1",
+    ))
+    .bind(device_id)
+    .bind(channel_id)
+    .execute(&mut *tx)
+    .await?;
+    if channel_lock.rows_affected() == 0 {
+        return Err(anyhow!("channel not found"));
+    }
     if let Some(ref_ref) = source_ref {
         let existing: Option<i64> = sqlx::query_scalar(db.sql(
             "SELECT seq FROM inbox WHERE channel_id = ? AND source_ref = ?",

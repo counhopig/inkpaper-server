@@ -14,13 +14,22 @@
 //! everything, including unowned devices (the ones the desktop tool
 //! registers), so existing desktop workflows keep working unchanged.
 
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use subtle::ConstantTimeEq;
+use inkwash_logic::sync_validate::{validate_date, validate_repeat};
 
 use crate::db::{self, Db};
 use crate::models::{
@@ -43,9 +52,97 @@ struct AdminAssets;
 pub struct AppState {
     pub db: Db,
     pub admin_token: String,
+    rate_limiter: Arc<RateLimiter>,
+}
+
+impl AppState {
+    pub fn new(db: Db, admin_token: String) -> Self {
+        Self {
+            db,
+            admin_token,
+            rate_limiter: Arc::new(RateLimiter::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RateLimiter {
+    buckets: Mutex<HashMap<String, RateBucket>>,
+}
+
+struct RateBucket {
+    started: Instant,
+    count: u32,
+}
+
+impl RateLimiter {
+    const WINDOW: Duration = Duration::from_secs(60);
+    const PER_IP_LIMIT: u32 = 120;
+    const PER_TOKEN_LIMIT: u32 = 240;
+
+    fn allow(&self, keys: &[(String, u32)]) -> bool {
+        let now = Instant::now();
+        let Ok(mut buckets) = self.buckets.lock() else {
+            return false;
+        };
+        buckets.retain(|_, bucket| now.duration_since(bucket.started) < Self::WINDOW);
+        if keys.iter().any(|(key, limit)| {
+            buckets
+                .get(key)
+                .is_some_and(|bucket| bucket.count >= *limit)
+        }) {
+            return false;
+        }
+        for (key, _) in keys {
+            let bucket = buckets.entry(key.clone()).or_insert(RateBucket {
+                started: now,
+                count: 0,
+            });
+            bucket.count += 1;
+        }
+        true
+    }
+}
+
+async fn enforce_rate_limit(
+    State(limiter): State<Arc<RateLimiter>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(|value| value.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut keys = vec![(format!("ip:{ip}"), RateLimiter::PER_IP_LIMIT)];
+    if let Some(token) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    {
+        let mut hasher = DefaultHasher::new();
+        token.hash(&mut hasher);
+        keys.push((
+            format!("token:{:016x}", hasher.finish()),
+            RateLimiter::PER_TOKEN_LIMIT,
+        ));
+    }
+    if !limiter.allow(&keys) {
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
+    }
+    next.run(request).await
 }
 
 pub fn router(state: AppState) -> Router {
+    let rate_limiter = state.rate_limiter.clone();
     Router::new()
         .route("/", get(admin_index))
         .route("/assets/*path", get(admin_asset))
@@ -104,6 +201,10 @@ pub fn router(state: AppState) -> Router {
             "/api/devices/:device_id/todos/:todo_id",
             put(update_todo).delete(delete_todo),
         )
+        .layer(middleware::from_fn_with_state(
+            rate_limiter,
+            enforce_rate_limit,
+        ))
         .with_state(state)
 }
 
@@ -149,12 +250,15 @@ async fn register_account(State(state): State<AppState>, Json(req): Json<AuthReq
     {
         return (StatusCode::CONFLICT, "username already taken").into_response();
     }
-    let hash = match crate::auth::hash_password(&req.password) {
+    let hash = match crate::auth::hash_password_async(req.password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
     let account = match db::register_account(&state.db, username, &hash).await {
         Ok(a) => a,
+        Err(err) if db::is_unique_violation(&err) => {
+            return (StatusCode::CONFLICT, "username already taken").into_response()
+        }
         Err(err) => return internal_error(err),
     };
     issue_session(&state, account).await
@@ -168,7 +272,7 @@ async fn login_account(State(state): State<AppState>, Json(req): Json<AuthReques
     };
     let account_id = match stored {
         Some((id, hash)) => {
-            if !crate::auth::verify_password(&req.password, &hash) {
+            if !crate::auth::verify_password_async(req.password.clone(), hash).await {
                 return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
             }
             id
@@ -176,10 +280,11 @@ async fn login_account(State(state): State<AppState>, Json(req): Json<AuthReques
         None => {
             // Verify against a throwaway hash so unknown usernames cost a
             // real Argon2 round too - no easy user enumeration by timing.
-            let _ = crate::auth::verify_password(
-                &req.password,
-                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            );
+            let _ = crate::auth::verify_password_async(
+                req.password.clone(),
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            )
+            .await;
             return (StatusCode::UNAUTHORIZED, "invalid username or password").into_response();
         }
     };
@@ -276,18 +381,19 @@ async fn change_password(
         Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid session").into_response(),
         Err(err) => return internal_error(err),
     };
-    if !crate::auth::verify_password(&req.old_password, &hash) {
+    if !crate::auth::verify_password_async(req.old_password.clone(), hash).await {
         return (StatusCode::UNAUTHORIZED, "current password is incorrect").into_response();
     }
     if let Err(msg) = crate::auth::validate_password(&req.new_password) {
         return bad_request(msg);
     }
-    let new_hash = match crate::auth::hash_password(&req.new_password) {
+    let new_hash = match crate::auth::hash_password_async(req.new_password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
     match db::update_account_password(&state.db, account_id, &new_hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
         Err(err) => internal_error(err),
     }
 }
@@ -295,28 +401,51 @@ async fn change_password(
 fn bad_request(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, message.into()).into_response()
 }
-
-fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), &'static str> {
+/// Validates an alarm against the same rules the firmware enforces in
+/// `sync_validate.rs` — hour/minute range, Repeat validity, and for
+/// `Once` alarms the exact date range the PCF8563 + firmware recurrence
+/// math supports (2000–2099, with a real calendar day for that month/year).
+/// Mirrors `inkwash-firmware/logic/src/sync_validate.rs:validate_repeat` +
+/// `validate_date` so server-authored alarms can never produce a sync
+/// response the device will reject wholesale.
+fn validate_alarm(req: &UpsertAlarmRequest) -> Result<(), String> {
     if req.hour > 23 || req.minute > 59 {
-        return Err("hour must be 0..23 and minute must be 0..59");
+        return Err(format!(
+            "alarm time {:02}:{:02} is out of range (hour 0..23, minute 0..59)",
+            req.hour, req.minute
+        ));
     }
     if req.label.chars().count() > 40 {
-        return Err("alarm label must be at most 40 characters");
+        return Err("alarm label must be at most 40 characters".to_string());
     }
-    if let crate::models::Repeat::Once { year, month, day } = req.repeat {
-        if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
-            return Err("invalid once-alarm date");
-        }
-    }
-    Ok(())
+    validate_repeat(&req.repeat)
+        .map_err(|err| format!("invalid repeat rule: {err}"))
 }
 
-fn validate_todo(req: &UpsertTodoRequest) -> Result<(), &'static str> {
+/// Validates a todo against the firmware's date/repeat rules
+/// (same crate as [`validate_alarm`]). `Once` is rejected because the
+/// device calendar/reminder logic only supports Daily/Weekly/Monthly for
+/// recurring todos — one-off due dates belong in `due_date`, not `repeat`.
+fn validate_todo(req: &UpsertTodoRequest) -> Result<(), String> {
+    let text_len = req.text.chars().count();
     if req.text.trim().is_empty() {
-        return Err("todo text must not be empty");
+        return Err("todo text must not be empty".to_string());
     }
-    if req.text.chars().count() > 120 {
-        return Err("todo text must be at most 120 characters");
+    if text_len > 120 {
+        return Err(format!(
+            "todo text must be at most 120 characters (got {text_len})"
+        ));
+    }
+    if let Some(due) = req.due_date {
+        validate_date(due.year, due.month, due.day)
+            .map_err(|err| format!("invalid due date: {err}"))?;
+    }
+    if let Some(repeat) = &req.repeat {
+        if matches!(repeat, crate::models::Repeat::Once { .. }) {
+            return Err("todo repeat Once is not supported; use due_date for a single due date".to_string());
+        }
+        validate_repeat(repeat)
+            .map_err(|err| format!("invalid repeat rule: {err}"))?;
     }
     Ok(())
 }
@@ -342,7 +471,7 @@ pub enum AuthSubject {
     /// A console-account session token; scoped to the account's own devices.
     Session { account_id: i64 },
     /// A device sync token issued by `register_device`.
-    Device { device_id: String, version: i64 },
+    Device { device_id: String },
     /// A webhook channel token, already verified against the channel named
     /// in the request path (`authenticate` is given `Some(channel_id)`).
     Channel { device_id: String },
@@ -378,7 +507,7 @@ pub async fn authenticate(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "storage error"));
         }
     }
-    if let Some((device_id, version)) =
+    if let Some((device_id, _)) =
         db::find_device_by_token(&state.db, token)
             .await
             .map_err(|err| {
@@ -386,7 +515,7 @@ pub async fn authenticate(
                 (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
             })?
     {
-        return Ok(AuthSubject::Device { device_id, version });
+        return Ok(AuthSubject::Device { device_id });
     }
     if let Some(channel_id) = channel_id {
         if let Some((device_id, token_hash)) = db::get_channel_for_delivery(&state.db, channel_id)
@@ -396,7 +525,7 @@ pub async fn authenticate(
                 (StatusCode::INTERNAL_SERVER_ERROR, "storage error")
             })?
         {
-            if crate::auth::verify_password(token, &token_hash) {
+            if crate::auth::verify_password_async(token.to_string(), token_hash).await {
                 return Ok(AuthSubject::Channel { device_id });
             }
         }
@@ -436,8 +565,15 @@ async fn require_device_access(
 }
 
 fn internal_error(err: anyhow::Error) -> Response {
+    // Log the full error internally but return only a generic message to the
+    // client to avoid leaking database details (table/column names, constraint
+    // values, foreign-key references) over the wire.
     tracing::error!("{err:#}");
-    (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+    )
+        .into_response()
 }
 
 // --- Admin: account management ---------------------------------------------
@@ -495,12 +631,13 @@ async fn admin_reset_password(
     if let Err(msg) = crate::auth::validate_password(&req.new_password) {
         return bad_request(msg);
     }
-    let hash = match crate::auth::hash_password(&req.new_password) {
+    let hash = match crate::auth::hash_password_async(req.new_password.clone()).await {
         Ok(h) => h,
         Err(err) => return internal_error(err),
     };
     match db::update_account_password(&state.db, account_id, &hash).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, "account not found").into_response(),
         Err(err) => internal_error(err),
     }
 }
@@ -509,6 +646,12 @@ async fn admin_reset_password(
 
 /// Builds the sync payload (alarms/todos + capped inbox). Reuses the inbox
 /// read-merge so the `inbox_read` upload is folded into the response.
+///
+/// Preflight-checks the serialized alarm and todo lists against the
+/// firmware's fixed NVS capacities (alarms 1024 bytes, todos 2048 bytes)
+/// — the same limits enforced by `inkwash-firmware/logic/src/sync_validate.rs`
+/// `validate_sync_response`. Without this, a device that can never fit the
+/// response will silently reject every sync, losing all new data.
 async fn build_sync_response(
     state: &AppState,
     device_id: &str,
@@ -526,14 +669,78 @@ async fn build_sync_response(
     let (inbox, truncated) = db::list_inbox(&state.db, device_id, INBOX_LIMIT)
         .await
         .map_err(internal_error)?;
-    Ok(SyncResponse {
+    // Preflight firmware NVS capacity — if the serialized list won't fit,
+    // reject now with a 409 Conflict instead of sending a response the
+    // device will reject and stall on.
+    if serde_json::to_vec(&alarms)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len()
+        > ALARM_NVS_CAPACITY
+    {
+        tracing::warn!(device_id, alarm_count = alarms.len(), "alarm list exceeds device NVS capacity");
+        return Err((
+            StatusCode::CONFLICT,
+            "alarm list exceeds device storage capacity",
+        )
+            .into_response());
+    }
+    if serde_json::to_vec(&todos)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len()
+        > TODO_NVS_CAPACITY
+    {
+        tracing::warn!(device_id, todo_count = todos.len(), "todo list exceeds device NVS capacity");
+        return Err((
+            StatusCode::CONFLICT,
+            "todo list exceeds device storage capacity",
+        )
+            .into_response());
+    }
+    let response = SyncResponse {
         alarms,
         todos,
         inbox,
         inbox_read_acked: acked,
         inbox_truncated: truncated,
-    })
+    };
+    // Preflight the firmware's total response buffer (16 KiB PSRAM) — the
+    // sum of all serialized fields must fit or the device truncates the JSON
+    // and reports a misleading parse error. See
+    // `inkwash-firmware/rust-firmware/src/sync.rs:35` (RESPONSE_BUF_LEN).
+    let total_len = serde_json::to_vec(&response)
+        .map_err(|e| internal_error(anyhow::anyhow!("{e}")))?
+        .len();
+    if total_len > SYNC_RESPONSE_BUDGET {
+        tracing::warn!(
+            device_id,
+            total_len,
+            alarm_count = response.alarms.len(),
+            todo_count = response.todos.len(),
+            inbox_count = response.inbox.len(),
+            "sync response exceeds firmware 16KiB buffer"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            "sync response payload too large for device buffer",
+        )
+            .into_response());
+    }
+    Ok(response)
 }
+
+/// Firmware's total sync response buffer size (16 KiB PSRAM). See
+/// `inkwash-firmware/rust-firmware/src/sync.rs:35` (RESPONSE_BUF_LEN).
+/// The server preflight-checks the full serialized response against this
+/// so the device never receives a truncated body.
+const SYNC_RESPONSE_BUDGET: usize = 16384;
+/// Firmware NVS storage budget for the alarm list (bytes of serialized JSON).
+/// See `inkwash-firmware/rust-firmware/src/alarms.rs:18` and
+/// `inkwash-firmware/logic/src/sync_validate.rs:100`.
+const ALARM_NVS_CAPACITY: usize = 1024;
+/// Firmware NVS storage budget for the todo list (bytes of serialized JSON).
+/// See `inkwash-firmware/rust-firmware/src/todos.rs:20` and
+/// `inkwash-firmware/logic/src/sync_validate.rs:110`.
+const TODO_NVS_CAPACITY: usize = 2048;
 
 /// Max inbox items sent to the device in one sync response (hard capacity).
 const INBOX_LIMIT: usize = 20;
@@ -552,11 +759,15 @@ async fn device_sync(State(state): State<AppState>, headers: HeaderMap) -> Respo
     // Only a device sync token is accepted on this endpoint - admin, session
     // and channel credentials get the same 401 they did from the old bare
     // `find_device_by_token` lookup.
-    let AuthSubject::Device { device_id, version } = subject else {
+    let AuthSubject::Device { device_id, .. } = subject else {
         tracing::warn!("sync rejected: non-device credentials");
         return (StatusCode::UNAUTHORIZED, "unknown device token").into_response();
     };
 
+    let version = match db::device_version(&state.db, &device_id).await {
+        Ok(version) => version,
+        Err(err) => return internal_error(err),
+    };
     let etag = sync_etag(&device_id, version);
     let if_none_match = headers
         .get(axum::http::header::IF_NONE_MATCH)
@@ -613,13 +824,16 @@ async fn device_push_sync(
         return Json(serde_json::json!({ "urgent": urgent })).into_response();
     }
 
-    let version = match db::merge_device_state(&state.db, &device_id, &req).await {
-        Ok(version) => version,
-        Err(err) => return internal_error(err),
-    };
+    if let Err(err) = db::merge_device_state(&state.db, &device_id, &req).await {
+        return internal_error(err);
+    }
     let body = match build_sync_response(&state, &device_id, &req.inbox_read).await {
         Ok(body) => Json(body),
         Err(resp) => return resp.into_response(),
+    };
+    let version = match db::device_version(&state.db, &device_id).await {
+        Ok(version) => version,
+        Err(err) => return internal_error(err),
     };
     let etag = sync_etag(&device_id, version);
     tracing::info!(
@@ -1156,10 +1370,7 @@ mod tests {
         let db = db::open("sqlite::memory:", 1)
             .await
             .expect("open in-memory db");
-        AppState {
-            db,
-            admin_token: "admin-token-123".to_string(),
-        }
+        AppState::new(db, "admin-token-123".to_string())
     }
 
     fn bearer(token: &str) -> HeaderMap {
@@ -1256,5 +1467,136 @@ mod tests {
                 .0,
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// Server-side validation must reject the same malformed dates and repeat
+    /// rules the firmware rejects in `sync_validate.rs`, so alarms/todos that
+    /// pass the server can never cause a device sync failure.
+    #[test]
+    fn validate_alarm_rejects_firmware_invalid_inputs() {
+        // Weekly days must be in 0..=6 — day 7 is the firmware's boundary test.
+        let bad_weekly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Weekly { days: vec![0, 7] },
+            enabled: true,
+            label: "Bad weekly".into(),
+        };
+        assert!(validate_alarm(&bad_weekly).is_err());
+
+        // Empty Weekly days list.
+        let empty_weekly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Weekly { days: vec![] },
+            enabled: true,
+            label: "Empty weekly".into(),
+        };
+        assert!(validate_alarm(&empty_weekly).is_err());
+
+        // Monthly days must be 1..=31 — day 0 and 32 are out of range.
+        let bad_monthly = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Monthly { days: vec![0] },
+            enabled: true,
+            label: "Bad monthly".into(),
+        };
+        assert!(validate_alarm(&bad_monthly).is_err());
+
+        // Once with an invalid calendar date (Feb 31).
+        let bad_once = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Once { year: 2026, month: 2, day: 31 },
+            enabled: true,
+            label: "Bad once".into(),
+        };
+        assert!(validate_alarm(&bad_once).is_err());
+
+        // Once year outside the firmware's 2000..=2099 window.
+        let bad_year = UpsertAlarmRequest {
+            hour: 10,
+            minute: 0,
+            repeat: crate::models::Repeat::Once { year: 1999, month: 12, day: 25 },
+            enabled: true,
+            label: "Bad year".into(),
+        };
+        assert!(validate_alarm(&bad_year).is_err());
+
+        // A valid alarm still passes.
+        let good = UpsertAlarmRequest {
+            hour: 7,
+            minute: 30,
+            repeat: crate::models::Repeat::Once { year: 2026, month: 12, day: 25 },
+            enabled: true,
+            label: "Christmas".into(),
+        };
+        assert!(validate_alarm(&good).is_ok());
+    }
+
+    #[test]
+    fn validate_todo_rejects_firmware_invalid_inputs() {
+        // Todo with Once repeat is rejected — use due_date instead.
+        let once_repeat = UpsertTodoRequest {
+            text: "One-off todo".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: None,
+            repeat: Some(crate::models::Repeat::Once { year: 2026, month: 6, day: 1 }),
+        };
+        assert!(validate_todo(&once_repeat).is_err());
+
+        // Todo with invalid due_date (April 31).
+        let bad_due = UpsertTodoRequest {
+            text: "Bad due".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: Some(crate::models::TodoDue { year: 2026, month: 4, day: 31 }),
+            repeat: None,
+        };
+        assert!(validate_todo(&bad_due).is_err());
+
+        // Empty text still rejected.
+        let empty_text = UpsertTodoRequest {
+            text: "  ".into(),
+            done: false,
+            importance: crate::models::Importance::Medium,
+            due_date: None,
+            repeat: None,
+        };
+        assert!(validate_todo(&empty_text).is_err());
+
+        // Valid todo with Weekly repeat and valid due_date passes.
+        let good = UpsertTodoRequest {
+            text: "Weekly review".into(),
+            done: false,
+            importance: crate::models::Importance::High,
+            due_date: Some(crate::models::TodoDue { year: 2026, month: 8, day: 19 }),
+            repeat: Some(crate::models::Repeat::Weekly { days: vec![1, 3, 5] }),
+        };
+        assert!(validate_todo(&good).is_ok());
+    }
+
+    /// build_sync_response rejects payloads that would exceed firmware NVS
+    /// capacity before the device ever sees them.
+    #[tokio::test]
+    async fn build_sync_response_rejects_oversized_alarm_list() {
+        let state = test_state().await;
+        let device = db::register_device(&state.db, "clock", None).await.unwrap();
+        // 3 alarms with 300-byte labels = >1024 serialized bytes.
+        let big_label = "Z".repeat(300);
+        for _ in 0..3 {
+            let req = UpsertAlarmRequest {
+                hour: 7,
+                minute: 0,
+                repeat: crate::models::Repeat::Daily,
+                enabled: true,
+                label: big_label.clone(),
+            };
+            db::upsert_alarm(&state.db, &device.id, None, &req).await.unwrap();
+        }
+        let result = build_sync_response(&state, &device.id, &[]).await;
+        assert!(result.is_err(), "expected NVS capacity pre-check to reject oversized alarm list");
     }
 }

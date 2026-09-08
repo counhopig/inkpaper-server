@@ -5,9 +5,8 @@
 //!
 //! `SQLITE_TABLES` is still duplicated here because the pre-UUID-era
 //! `migrate_legacy_integer_ids` rebuild (SQLite-only) drops and recreates
-//! the three legacy tables inside a transaction, which can't re-run an
-//! already-applied migration file. Keep it in sync with
-//! `migrations/sqlite/0001_init.sql`.
+//! tables inside a transaction, which can't re-run an already-applied
+//! migration file. Keep it in sync with the current SQLite migrations.
 
 use anyhow::{Context, Result};
 use sqlx::any::AnyPoolOptions;
@@ -50,6 +49,11 @@ pub async fn open(url: &str, max_connections: u32) -> Result<Db> {
         options = options.after_connect(|conn, _meta| {
             Box::pin(async move {
                 sqlx::query("PRAGMA foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                // Wait briefly for another writer instead of surfacing an
+                // avoidable SQLITE_BUSY error to the HTTP layer.
+                sqlx::query("PRAGMA busy_timeout = 5000")
                     .execute(&mut *conn)
                     .await?;
                 Ok(())
@@ -166,9 +170,11 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
             .collect::<Result<Vec<_>>>()?
     };
 
-    sqlx::raw_sql("DROP TABLE alarms; DROP TABLE todos; DROP TABLE devices;")
-        .execute(&mut *tx)
-        .await?;
+    sqlx::raw_sql(
+        "DROP TABLE device_local_ids; DROP TABLE alarms; DROP TABLE todos; DROP TABLE devices;",
+    )
+    .execute(&mut *tx)
+    .await?;
     // Recreate with the UUID schema (SQLite dialect - this path is SQLite-only).
     sqlx::raw_sql(SQLITE_TABLES).execute(&mut *tx).await?;
 
@@ -230,6 +236,14 @@ async fn migrate_legacy_integer_ids(db: &Db) -> Result<()> {
             .execute(&mut *tx)
             .await?;
     }
+    sqlx::raw_sql(
+        "INSERT OR IGNORE INTO device_local_ids (device_id, kind, local_id)
+         SELECT device_id, 'alarm', local_id FROM alarms;
+         INSERT OR IGNORE INTO device_local_ids (device_id, kind, local_id)
+         SELECT device_id, 'todo', local_id FROM todos;",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     tracing::info!("migrated {} devices to UUID ids", devices.len());
     Ok(())
@@ -278,9 +292,9 @@ async fn backfill_missing_columns(db: &Db) -> Result<()> {
 }
 
 /// Recreates the SQLite schema for `migrate_legacy_integer_ids`'s
-/// drop-and-rebuild path. Keep in sync with `migrations/sqlite/0001_init.sql`
-/// - that file is the schema's canonical home; this copy exists only because
-///   a rebuild inside a transaction can't re-run an applied migration.
+/// drop-and-rebuild path. Keep in sync with the current migration schema -
+/// these statements are duplicated only because a rebuild inside a
+/// transaction can't re-run an applied migration.
 const SQLITE_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -291,7 +305,8 @@ const SQLITE_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY,
@@ -327,6 +342,13 @@ const SQLITE_TABLES: &str = "
         repeat_kind TEXT,
         repeat_days TEXT,
         PRIMARY KEY (device_id, local_id)
+    );
+    CREATE TABLE IF NOT EXISTS device_local_ids (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('alarm', 'todo')),
+        local_id INTEGER NOT NULL,
+        released INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (device_id, kind, local_id)
     );
     CREATE TABLE IF NOT EXISTS channels (
         id TEXT PRIMARY KEY,
